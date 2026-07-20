@@ -7,6 +7,9 @@ Automatic headlight controller for an Arduino Nano using a BH1750 ambient light 
 - Automatic relay control from ambient light (lux)
 - Potentiometer-adjustable AUTO threshold (`10` to `200` lux)
 - Hysteresis plus ON/OFF delay to prevent relay chatter
+- Fail-safe behavior:
+  - Relay stays OFF if the BH1750 sensor fails to initialize or returns an invalid reading
+  - OLED display is skipped automatically if initialization fails
 - Manual override with SPDT center-off switch:
   - Force ON
   - AUTO (center)
@@ -79,6 +82,8 @@ Install these libraries in Arduino IDE / Arduino CLI:
 - Relay switches ON only after sustained darkness (`AUTO_ON_DELAY_MS`).
 - Relay switches OFF only after sustained brightness (`AUTO_OFF_DELAY_MS`).
 - Hysteresis (`HYSTERESIS_LUX`) prevents flicker near threshold.
+- If the BH1750 sensor is unavailable or returns a bad reading, the sketch forces the relay OFF and disables AUTO control until reset.
+- If the OLED fails to initialize, the controller still runs without the display.
 
 ### Display example
 

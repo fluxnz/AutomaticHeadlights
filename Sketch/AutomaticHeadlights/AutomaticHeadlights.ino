@@ -29,6 +29,8 @@ enum ControlMode {
 float currentLux = 0.0f;
 float filteredLux = 0.0f;
 bool relayClosed = false;  // Closed = headlights ON.
+bool displayReady = false;
+bool sensorReady = false;
 
 unsigned long lastSensorReadMs = 0;
 unsigned long lastDisplayRefreshMs = 0;
@@ -85,6 +87,9 @@ float readThresholdFromPot() {
 void updateAutoRelayWithDelay(unsigned long now, float thresholdLux) {
 	float onTriggerLux = thresholdLux - HYSTERESIS_LUX;
 	float offTriggerLux = thresholdLux + HYSTERESIS_LUX;
+	if (onTriggerLux < 0.0f) {
+		onTriggerLux = 0.0f;
+	}
 
 	if (!relayClosed) {
 		// Open relay (lights OFF): require sustained dark before turning ON.
@@ -182,10 +187,14 @@ void setup() {
 	writeRelay(false);
 
 	Wire.begin();
-	lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+	sensorReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+	if (!sensorReady) {
+		writeRelay(false);
+	}
 
 	// Keep running even if display init fails; controller logic still works.
-	if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+	displayReady = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+	if (!displayReady) {
 		// No display found; continue headlight logic silently.
 	} else {
 		display.clearDisplay();
@@ -204,20 +213,35 @@ void loop() {
 	if (now - lastSensorReadMs >= SENSOR_INTERVAL_MS) {
 		lastSensorReadMs = now;
 
-		currentLux = lightMeter.readLightLevel();
-		if (currentLux < 0.0f) {
-			currentLux = filteredLux;
+		if (sensorReady) {
+			currentLux = lightMeter.readLightLevel();
+			if (currentLux < 0.0f || isnan(currentLux)) {
+				sensorReady = false;
+				writeRelay(false);
+				darkCandidateStartMs = 0;
+				brightCandidateStartMs = 0;
+				currentLux = 0.0f;
+				filteredLux = 0.0f;
+			} else {
+				// Lightweight smoothing for stable display and control.
+				filteredLux = (filteredLux * 0.75f) + (currentLux * 0.25f);
+				currentLux = filteredLux;
+			}
+		} else {
+			writeRelay(false);
+			darkCandidateStartMs = 0;
+			brightCandidateStartMs = 0;
 		}
-
-		// Lightweight smoothing for stable display and control.
-		filteredLux = (filteredLux * 0.75f) + (currentLux * 0.25f);
-		currentLux = filteredLux;
 	}
 
 	ControlMode mode = readModeFromSwitch();
 	float thresholdLux = readThresholdFromPot();
 
-	if (mode == MODE_FORCE_ON) {
+	if (!sensorReady) {
+		writeRelay(false);
+		darkCandidateStartMs = 0;
+		brightCandidateStartMs = 0;
+	} else if (mode == MODE_FORCE_ON) {
 		writeRelay(true);
 		darkCandidateStartMs = 0;
 		brightCandidateStartMs = 0;
@@ -229,7 +253,7 @@ void loop() {
 		updateAutoRelayWithDelay(now, thresholdLux);
 	}
 
-	if (display.width() > 0 && (now - lastDisplayRefreshMs >= DISPLAY_INTERVAL_MS)) {
+	if (displayReady && (now - lastDisplayRefreshMs >= DISPLAY_INTERVAL_MS)) {
 		lastDisplayRefreshMs = now;
 		drawUi(mode, thresholdLux);
 	}
