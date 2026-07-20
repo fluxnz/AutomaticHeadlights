@@ -1,0 +1,8 @@
+Arduino Nano
+BH1750 GY-302 I2C Light Sensor Module
+SSD1306 0.96" OLED 128x64 I2C Display
+10k Linear Potentiometer (B10K)
+SPDT Centre-Off Toggle Switch (ON-OFF-ON)
+5V 1-Channel Relay Module (SRD-05VDC-SL-C)
+470µF 16V Electrolytic Capacitor
+100nF Ceramic Capacitor
