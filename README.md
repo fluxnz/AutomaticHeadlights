@@ -9,16 +9,16 @@ Automatic headlight controller for an Arduino Nano using a BH1750 ambient light 
 - Hysteresis plus ON/OFF delay to prevent relay chatter
 - Fail-safe behavior:
   - Relay stays OFF if the BH1750 sensor fails to initialize or returns an invalid reading
-  - OLED display is skipped automatically if initialization fails
+  - Relay logic continues even if the OLED is disconnected or unavailable
 - Manual override with SPDT center-off switch:
   - Force ON
   - AUTO (center)
   - Force OFF
 - OLED UI with day/night icon and live values:
   - Mode (`AUTO` / `FORCE ON` / `FORCE OFF`)
-  - `Lux` (live measured light)
-  - `Set` (potentiometer threshold)
-  - `Lights` (`ON` / `OFF`)
+  - `LUX` (live measured light)
+  - `SET` (potentiometer threshold)
+  - `LIGHT` (`ON` / `OFF` badge)
 
 ## Hardware
 
@@ -65,8 +65,7 @@ The sketch uses `INPUT_PULLUP` for the switch pins, so active switch position pu
 Install these libraries in Arduino IDE / Arduino CLI:
 
 - `BH1750`
-- `Adafruit GFX Library`
-- `Adafruit SSD1306`
+- `U8g2`
 
 ## Build and upload
 
@@ -83,14 +82,14 @@ Install these libraries in Arduino IDE / Arduino CLI:
 - Relay switches OFF only after sustained brightness (`AUTO_OFF_DELAY_MS`).
 - Hysteresis (`HYSTERESIS_LUX`) prevents flicker near threshold.
 - If the BH1750 sensor is unavailable or returns a bad reading, the sketch forces the relay OFF and disables AUTO control until reset.
-- If the OLED fails to initialize, the controller still runs without the display.
+- Display rendering uses U8g2 page buffering (`_1_` constructor variant).
 
 ### Display example
 
 AUTO  
-Lux: 42  
-Set: 60  
-Lights: OFF
+LUX 42 lx  
+SET 60 lx  
+LIGHT OFF
 
 ## Safety note
 

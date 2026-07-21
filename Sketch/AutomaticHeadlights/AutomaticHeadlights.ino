@@ -1,7 +1,6 @@
 #include <Wire.h>
 #include <BH1750.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
 
 // -------- Hardware configuration --------
 static const uint8_t PIN_RELAY = 8;
@@ -13,10 +12,7 @@ static const uint8_t PIN_SWITCH_FORCE_OFF = 3;
 static const bool RELAY_ACTIVE_LOW = true;
 
 // OLED (128x64, I2C)
-static const uint8_t OLED_WIDTH = 128;
-static const uint8_t OLED_HEIGHT = 64;
-static const int8_t OLED_RESET_PIN = -1;
-Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C display(U8G2_R0);
 
 BH1750 lightMeter;
 
@@ -123,59 +119,86 @@ void updateAutoRelayWithDelay(unsigned long now, float thresholdLux) {
 }
 
 void drawSunIcon(int16_t cx, int16_t cy) {
-	display.fillCircle(cx, cy, 7, SSD1306_WHITE);
-	display.fillCircle(cx, cy, 4, SSD1306_BLACK);
+	display.setDrawColor(1);
+	display.drawDisc(cx, cy, 7);
+	display.setDrawColor(0);
+	display.drawDisc(cx, cy, 4);
+	display.setDrawColor(1);
 	for (uint8_t i = 0; i < 8; i++) {
 		float a = i * 0.785398f;  // 2*pi/8
 		int16_t x0 = cx + static_cast<int16_t>(9 * cos(a));
 		int16_t y0 = cy + static_cast<int16_t>(9 * sin(a));
 		int16_t x1 = cx + static_cast<int16_t>(13 * cos(a));
 		int16_t y1 = cy + static_cast<int16_t>(13 * sin(a));
-		display.drawLine(x0, y0, x1, y1, SSD1306_WHITE);
+		display.drawLine(x0, y0, x1, y1);
 	}
 }
 
 void drawMoonIcon(int16_t cx, int16_t cy) {
-	display.fillCircle(cx, cy, 8, SSD1306_WHITE);
-	display.fillCircle(cx + 4, cy - 2, 8, SSD1306_BLACK);
+	display.setDrawColor(1);
+	display.drawDisc(cx, cy, 8);
+	display.setDrawColor(0);
+	display.drawDisc(cx + 4, cy - 2, 8);
+	display.setDrawColor(1);
 }
 
 void drawUi(ControlMode mode, float thresholdLux) {
-	display.clearDisplay();
+	display.firstPage();
+	do {
+		display.setDrawColor(1);
+		display.setFont(u8g2_font_7x13B_tf);
 
-	display.setTextSize(1);
-	display.setTextColor(SSD1306_WHITE);
+		display.setCursor(0, 12);
+		// Mode heading kept short so the setpoint and status are easy to read at a glance.
+		if (mode == MODE_FORCE_ON) {
+			display.println(F("FORCE ON"));
+		} else if (mode == MODE_FORCE_OFF) {
+			display.println(F("FORCE OFF"));
+		} else {
+			display.println(F("AUTO"));
+		}
+		display.drawHLine(0, 14, 128);
 
-	display.setCursor(0, 0);
-	// Mode heading kept short so the setpoint and status are easy to read at a glance.
-	if (mode == MODE_FORCE_ON) {
-		display.println(F("FORCE ON"));
-	} else if (mode == MODE_FORCE_OFF) {
-		display.println(F("FORCE OFF"));
-	} else {
-		display.println(F("AUTO"));
-	}
+		display.setFont(u8g2_font_5x8_tf);
+		display.setCursor(0, 24);
+		display.print(F("LUX"));
+		display.setCursor(0, 39);
+		display.print(F("SET"));
+		display.setCursor(0, 54);
+		display.print(F("LIGHT"));
 
-	display.setCursor(0, 14);
-	display.print(F("Lux: "));
-	display.println(static_cast<int>(currentLux + 0.5f));
+		display.setFont(u8g2_font_8x13B_tf);
+		display.setCursor(26, 28);
+		display.print(static_cast<int>(currentLux + 0.5f));
+		display.setFont(u8g2_font_5x8_tf);
+		display.print(F(" lx"));
 
-	display.setCursor(0, 26);
-	display.print(F("Set: "));
-	display.println(static_cast<int>(thresholdLux + 0.5f));
+		display.setFont(u8g2_font_8x13B_tf);
+		display.setCursor(26, 43);
+		display.print(static_cast<int>(thresholdLux + 0.5f));
+		display.setFont(u8g2_font_5x8_tf);
+		display.print(F(" lx"));
 
-	display.setCursor(0, 38);
-	display.print(F("Lights: "));
-	display.println(relayClosed ? F("ON") : F("OFF"));
+		display.setFont(u8g2_font_6x12_tf);
+		if (relayClosed) {
+			display.drawBox(26, 45, 28, 14);
+			display.setDrawColor(0);
+			display.setCursor(32, 56);
+			display.print(F("ON"));
+			display.setDrawColor(1);
+		} else {
+			display.drawFrame(26, 45, 32, 14);
+			display.setCursor(30, 56);
+			display.print(F("OFF"));
+		}
 
-	bool darkNow = currentLux < thresholdLux;
-	if (darkNow) {
-		drawMoonIcon(108, 20);
-	} else {
-		drawSunIcon(108, 20);
-	}
-
-	display.display();
+		bool darkNow = currentLux < thresholdLux;
+		if (darkNow) {
+			drawMoonIcon(108, 24);
+		} else {
+			drawSunIcon(108, 24);
+		}
+	} while (display.nextPage());
 }
 
 void setup() {
@@ -192,19 +215,21 @@ void setup() {
 		writeRelay(false);
 	}
 
-	// Keep running even if display init fails; controller logic still works.
-	displayReady = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-	if (!displayReady) {
-		// No display found; continue headlight logic silently.
-	} else {
-		display.clearDisplay();
-		display.setTextSize(1);
-		display.setTextColor(SSD1306_WHITE);
-		display.setCursor(0, 0);
+	// U8g2 does not provide a simple init-fail status; begin and continue.
+	display.begin();
+	displayReady = true;
+	display.firstPage();
+	do {
+		display.setDrawColor(1);
+		display.setFont(u8g2_font_7x13B_tf);
+		int16_t titleX = (128 - display.getStrWidth("Auto Headlights")) / 2;
+		display.setCursor(titleX, 24);
 		display.println(F("Auto Headlights"));
+		display.setFont(u8g2_font_6x12_tf);
+		int16_t initX = (128 - display.getStrWidth("Init...")) / 2;
+		display.setCursor(initX, 42);
 		display.println(F("Init..."));
-		display.display();
-	}
+	} while (display.nextPage());
 }
 
 void loop() {
