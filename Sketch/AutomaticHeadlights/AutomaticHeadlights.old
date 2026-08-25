@@ -28,27 +28,35 @@ float filteredLux = 0.0f;
 bool relayClosed = false;  // Closed = headlights ON.
 bool displayReady = false;
 bool sensorReady = false;
+bool hasLuxSample = false;
 
 unsigned long lastSensorReadMs = 0;
 unsigned long lastDisplayRefreshMs = 0;
 unsigned long darkCandidateStartMs = 0;
 unsigned long brightCandidateStartMs = 0;
+unsigned long lastSensorReinitAttemptMs = 0;
+uint8_t consecutiveSensorErrors = 0;
 
 static const uint16_t SENSOR_INTERVAL_MS = 200;
 static const uint16_t DISPLAY_INTERVAL_MS = 120;
 static const uint16_t AUTO_ON_DELAY_MS = 2500;
 static const uint16_t AUTO_OFF_DELAY_MS = 4000;
+static const uint16_t SENSOR_REINIT_INTERVAL_MS = 1500;
+static const uint8_t MAX_SENSOR_ERRORS_BEFORE_FAULT = 5;
+static const uint16_t INPUT_DEBOUNCE_MS = 40;
 
 // Map potentiometer (0..1023) to an easy-to-tune AUTO trigger range.
-// Left 0 lx (very dark), center ~200 lx, right 400 lx.
-static const float THRESHOLD_MIN_LUX = 0.0f;
+// Pot controls the AUTO trigger threshold from 10..400 lx.
+static const float THRESHOLD_MIN_LUX = 10.0f;
 static const float THRESHOLD_MAX_LUX = 400.0f;
 
 // Hysteresis band to avoid relay chatter around threshold.
 static const float HYSTERESIS_LUX = 35.0f;
 
-// BH1750 high-res mode tops out well below this; anything above is a bad reading.
-static const float MAX_VALID_LUX = 60000.0f;
+static const int8_t SUN_RAY_X0[8] = {12, 8, 0, -8, -12, -8, 0, 8};
+static const int8_t SUN_RAY_Y0[8] = {0, 8, 12, 8, 0, -8, -12, -8};
+static const int8_t SUN_RAY_X1[8] = {17, 12, 0, -12, -17, -12, 0, 12};
+static const int8_t SUN_RAY_Y1[8] = {0, 12, 17, 12, 0, -12, -17, -12};
 
 void writeRelay(bool closed) {
 	relayClosed = closed;
@@ -61,11 +69,17 @@ void writeRelay(bool closed) {
 	digitalWrite(PIN_RELAY, pinState);
 }
 
-ControlMode readModeFromSwitch() {
-	// Switch expected wiring:
-	// - Common to GND
-	// - One throw to D2 (force ON), other throw to D3 (force OFF)
-	// - Center OFF leaves both pins HIGH via INPUT_PULLUP
+void resetAutoTimers() {
+	darkCandidateStartMs = 0;
+	brightCandidateStartMs = 0;
+}
+
+void forceRelayOpenAndReset() {
+	writeRelay(false);
+	resetAutoTimers();
+}
+
+ControlMode readModeFromSwitchRaw() {
 	bool forceOnActive = digitalRead(PIN_SWITCH_FORCE_ON) == LOW;
 	bool forceOffActive = digitalRead(PIN_SWITCH_FORCE_OFF) == LOW;
 
@@ -78,16 +92,76 @@ ControlMode readModeFromSwitch() {
 	return MODE_AUTO;
 }
 
+ControlMode readModeFromSwitch() {
+	// Switch expected wiring:
+	// - Common to GND
+	// - One throw to D2 (force ON), other throw to D3 (force OFF)
+	// - Center OFF leaves both pins HIGH via INPUT_PULLUP
+	static bool initialized = false;
+	static ControlMode stableMode = MODE_AUTO;
+	static ControlMode lastSample = MODE_AUTO;
+	static unsigned long lastChangeMs = 0;
+	unsigned long now = millis();
+	ControlMode sample = readModeFromSwitchRaw();
+
+	if (!initialized) {
+		initialized = true;
+		stableMode = sample;
+		lastSample = sample;
+		lastChangeMs = now;
+		return stableMode;
+	}
+
+	if (sample != lastSample) {
+		lastSample = sample;
+		lastChangeMs = now;
+	}
+
+	if (now - lastChangeMs >= INPUT_DEBOUNCE_MS) {
+		stableMode = lastSample;
+	}
+
+	return stableMode;
+}
+
+bool readHandbrakeRaw() {
+	return digitalRead(PIN_HANDBRAKE) == LOW;
+}
+
 bool isHandbrakeOn() {
 	// Handbrake wire is expected to be earthed when engaged.
 	// With INPUT_PULLUP, LOW means handbrake ON.
-	return digitalRead(PIN_HANDBRAKE) == LOW;
+	static bool initialized = false;
+	static bool stableState = false;
+	static bool lastSample = false;
+	static unsigned long lastChangeMs = 0;
+	unsigned long now = millis();
+	bool sample = readHandbrakeRaw();
+
+	if (!initialized) {
+		initialized = true;
+		stableState = sample;
+		lastSample = sample;
+		lastChangeMs = now;
+		return stableState;
+	}
+
+	if (sample != lastSample) {
+		lastSample = sample;
+		lastChangeMs = now;
+	}
+
+	if (now - lastChangeMs >= INPUT_DEBOUNCE_MS) {
+		stableState = lastSample;
+	}
+
+	return stableState;
 }
 
 float readThresholdFromPot() {
 	int pot = analogRead(PIN_POT);
-	return THRESHOLD_MIN_LUX +
-				 (THRESHOLD_MAX_LUX - THRESHOLD_MIN_LUX) * (static_cast<float>(pot) / 1023.0f);
+	return THRESHOLD_MAX_LUX -
+					 (THRESHOLD_MAX_LUX - THRESHOLD_MIN_LUX) * (static_cast<float>(pot) / 1023.0f);
 }
 
 void updateAutoRelayWithDelay(unsigned long now, float thresholdLux) {
@@ -130,25 +204,24 @@ void updateAutoRelayWithDelay(unsigned long now, float thresholdLux) {
 
 void drawSunIcon(int16_t cx, int16_t cy) {
 	display.setDrawColor(1);
-	display.drawDisc(cx, cy, 7);
+	display.drawDisc(cx, cy, 10);
 	display.setDrawColor(0);
-	display.drawDisc(cx, cy, 4);
+	display.drawDisc(cx, cy, 6);
 	display.setDrawColor(1);
 	for (uint8_t i = 0; i < 8; i++) {
-		float a = i * 0.785398f;  // 2*pi/8
-		int16_t x0 = cx + static_cast<int16_t>(9 * cos(a));
-		int16_t y0 = cy + static_cast<int16_t>(9 * sin(a));
-		int16_t x1 = cx + static_cast<int16_t>(13 * cos(a));
-		int16_t y1 = cy + static_cast<int16_t>(13 * sin(a));
+		int16_t x0 = cx + SUN_RAY_X0[i];
+		int16_t y0 = cy + SUN_RAY_Y0[i];
+		int16_t x1 = cx + SUN_RAY_X1[i];
+		int16_t y1 = cy + SUN_RAY_Y1[i];
 		display.drawLine(x0, y0, x1, y1);
 	}
 }
 
 void drawMoonIcon(int16_t cx, int16_t cy) {
 	display.setDrawColor(1);
-	display.drawDisc(cx, cy, 8);
+	display.drawDisc(cx, cy, 11);
 	display.setDrawColor(0);
-	display.drawDisc(cx + 4, cy - 2, 8);
+	display.drawDisc(cx + 5, cy - 3, 11);
 	display.setDrawColor(1);
 }
 
@@ -173,9 +246,12 @@ void drawUi(ControlMode mode, float thresholdLux) {
 		display.setFont(u8g2_font_6x12_tf);
 		display.setCursor(0, 25);
 		display.print(F("Lux: "));
-		float displayLux = constrain(currentLux, 0.0f, 32767.0f);
-		display.print(static_cast<int>(displayLux + 0.5f));
-		display.print(F(" lx"));
+		if (sensorReady) {
+			display.print(static_cast<int>(currentLux + 0.5f));
+			display.print(F(" lx"));
+		} else {
+			display.print(F("ERR"));
+		}
 
 		display.setCursor(0, 37);
 		display.print(F("Set: "));
@@ -183,18 +259,20 @@ void drawUi(ControlMode mode, float thresholdLux) {
 		display.print(F(" lx"));
 
 		display.setCursor(0, 49);
-		display.print(F("Brake: "));
+		display.print(F("E-Brake: "));
 		display.print(handbrakeOn ? F("ON") : F("OFF"));
 
 		display.setCursor(0, 61);
 		display.print(F("Light: "));
-		display.print(relayClosed ? F("ON") : F("OFF"));
+		display.print(relayClosed ? F("ON ") : F("OFF"));
+		display.print(F(" S:"));
+		display.print(sensorReady ? F("OK") : F("ERR"));
 
 		bool darkNow = currentLux < thresholdLux;
 		if (darkNow) {
-			drawMoonIcon(108, 34);
+			drawMoonIcon(108, 33);
 		} else {
-			drawSunIcon(108, 34);
+			drawSunIcon(108, 33);
 		}
 	} while (display.nextPage());
 }
@@ -209,28 +287,25 @@ void setup() {
 	writeRelay(false);
 
 	Wire.begin();
-	// Prevent an I2C glitch (e.g. sensor saturating in bright light) from hanging the sketch forever.
-	Wire.setWireTimeout(25000, true);
 	sensorReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
 	if (!sensorReady) {
-		writeRelay(false);
+		forceRelayOpenAndReset();
 	}
 
 	// U8g2 does not provide a simple init-fail status; begin and continue.
 	display.begin();
 	displayReady = true;
+
+	// Single splash screen: one centered title line.
 	display.firstPage();
 	do {
 		display.setDrawColor(1);
 		display.setFont(u8g2_font_7x13B_tf);
-		int16_t titleX = (128 - display.getStrWidth("Auto Headlights")) / 2;
-		display.setCursor(titleX, 24);
-		display.println(F("Auto Headlights"));
-		display.setFont(u8g2_font_6x12_tf);
-		int16_t initX = (128 - display.getStrWidth("Init...")) / 2;
-		display.setCursor(initX, 42);
-		display.println(F("Init..."));
+		int16_t titleX = (128 - display.getStrWidth("Headlight Control")) / 2;
+		display.setCursor(titleX, 32);
+		display.println(F("Headlight Control"));
 	} while (display.nextPage());
+	delay(3000);
 }
 
 void loop() {
@@ -240,24 +315,37 @@ void loop() {
 		lastSensorReadMs = now;
 
 		if (sensorReady) {
-			currentLux = lightMeter.readLightLevel();
-			// isnan() alone misses +Infinity, which a saturated/glitching sensor can return.
-			if (currentLux < 0.0f || isnan(currentLux) || isinf(currentLux) || currentLux > MAX_VALID_LUX) {
-				sensorReady = false;
-				writeRelay(false);
-				darkCandidateStartMs = 0;
-				brightCandidateStartMs = 0;
-				currentLux = 0.0f;
-				filteredLux = 0.0f;
+			float rawLux = lightMeter.readLightLevel();
+			if (rawLux < 0.0f || isnan(rawLux)) {
+				if (consecutiveSensorErrors < 255) {
+					consecutiveSensorErrors++;
+				}
+				if (consecutiveSensorErrors >= MAX_SENSOR_ERRORS_BEFORE_FAULT) {
+					sensorReady = false;
+					hasLuxSample = false;
+					forceRelayOpenAndReset();
+				}
 			} else {
-				// Lightweight smoothing for stable display and control.
-				filteredLux = (filteredLux * 0.75f) + (currentLux * 0.25f);
+				consecutiveSensorErrors = 0;
+				if (!hasLuxSample) {
+					filteredLux = rawLux;
+					hasLuxSample = true;
+				} else {
+					// Lightweight smoothing for stable display and control.
+					filteredLux = (filteredLux * 0.75f) + (rawLux * 0.25f);
+				}
 				currentLux = filteredLux;
 			}
 		} else {
-			writeRelay(false);
-			darkCandidateStartMs = 0;
-			brightCandidateStartMs = 0;
+			if (now - lastSensorReinitAttemptMs >= SENSOR_REINIT_INTERVAL_MS) {
+				lastSensorReinitAttemptMs = now;
+				sensorReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+				if (sensorReady) {
+					consecutiveSensorErrors = 0;
+					hasLuxSample = false;
+				}
+			}
+			forceRelayOpenAndReset();
 		}
 	}
 
@@ -267,21 +355,14 @@ void loop() {
 
 	if (handbrakeOn) {
 		// Safety interlock: handbrake engaged keeps headlights relay open.
-		writeRelay(false);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		forceRelayOpenAndReset();
 	} else if (!sensorReady) {
-		writeRelay(false);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		forceRelayOpenAndReset();
 	} else if (mode == MODE_FORCE_ON) {
 		writeRelay(true);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		resetAutoTimers();
 	} else if (mode == MODE_FORCE_OFF) {
-		writeRelay(false);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		forceRelayOpenAndReset();
 	} else {
 		updateAutoRelayWithDelay(now, thresholdLux);
 	}

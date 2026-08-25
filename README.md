@@ -5,7 +5,7 @@ Automatic headlight controller for an Arduino Nano using a BH1750 ambient light 
 ## Features
 
 - Automatic relay control from ambient light (lux)
-- Potentiometer-adjustable AUTO threshold (`10` to `200` lux)
+- Potentiometer-adjustable AUTO threshold (`0` to `400` lux)
 - Hysteresis plus ON/OFF delay to prevent relay chatter
 - Fail-safe behavior:
   - Relay stays OFF if the BH1750 sensor fails to initialize or returns an invalid reading
@@ -48,8 +48,11 @@ Automatic headlight controller for an Arduino Nano using a BH1750 ambient light 
 - Toggle switch common -> `GND`
 - Toggle throw 1 -> Nano `D2` (force ON)
 - Toggle throw 2 -> Nano `D3` (force OFF)
+- Handbrake wire -> Nano `D4`
+- Vehicle ground -> Nano `GND`
 
 The sketch uses `INPUT_PULLUP` for the switch pins, so active switch position pulls pin `LOW`.
+The handbrake input also uses `INPUT_PULLUP`, so when the handbrake wire is earthed, `D4` reads `LOW` (handbrake ON).
 
 ## Capacitor placement (recommended)
 
@@ -77,19 +80,21 @@ Install these libraries in Arduino IDE / Arduino CLI:
 
 ## Runtime behavior
 
-- AUTO mode maps potentiometer value (`0-1023`) to `10-200` lux setpoint.
+- AUTO mode maps potentiometer value (`0-1023`) to `0-400` lux setpoint.
 - Relay switches ON only after sustained darkness (`AUTO_ON_DELAY_MS`).
 - Relay switches OFF only after sustained brightness (`AUTO_OFF_DELAY_MS`).
 - Hysteresis (`HYSTERESIS_LUX`) prevents flicker near threshold.
 - If the BH1750 sensor is unavailable or returns a bad reading, the sketch forces the relay OFF and disables AUTO control until reset.
+- If the handbrake is ON (earthed input on `D4`), the sketch forces the relay OFF in all modes (AUTO / FORCE ON / FORCE OFF).
 - Display rendering uses U8g2 page buffering (`_1_` constructor variant).
 
 ### Display example
 
 AUTO  
-LUX 42 lx  
-SET 60 lx  
-LIGHT OFF
+Lux: 18 lx  
+Set: 40 lx  
+Brake: ON  
+Light: OFF
 
 ## Safety note
 
