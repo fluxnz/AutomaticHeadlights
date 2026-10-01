@@ -28,16 +28,23 @@ float filteredLux = 0.0f;
 bool relayClosed = false;  // Closed = headlights ON.
 bool displayReady = false;
 bool sensorReady = false;
+bool hasLuxSample = false;
 
 unsigned long lastSensorReadMs = 0;
 unsigned long lastDisplayRefreshMs = 0;
 unsigned long darkCandidateStartMs = 0;
 unsigned long brightCandidateStartMs = 0;
+unsigned long lastSensorReinitAttemptMs = 0;
+unsigned long lastI2cRecoveryMs = 0;
+uint8_t consecutiveSensorErrors = 0;
 
 static const uint16_t SENSOR_INTERVAL_MS = 200;
 static const uint16_t DISPLAY_INTERVAL_MS = 120;
 static const uint16_t AUTO_ON_DELAY_MS = 2500;
 static const uint16_t AUTO_OFF_DELAY_MS = 4000;
+static const uint16_t SENSOR_REINIT_INTERVAL_MS = 1500;
+static const uint16_t I2C_RECOVERY_INTERVAL_MS = 10000;
+static const uint8_t MAX_SENSOR_ERRORS_BEFORE_FAULT = 5;
 
 // Map potentiometer (0..1023) to an easy-to-tune AUTO trigger range.
 // Left 0 lx (very dark), center ~200 lx, right 400 lx.
@@ -49,6 +56,16 @@ static const float HYSTERESIS_LUX = 35.0f;
 
 // BH1750 high-res mode tops out well below this; anything above is a bad reading.
 static const float MAX_VALID_LUX = 60000.0f;
+
+void resetAutoTimers() {
+	darkCandidateStartMs = 0;
+	brightCandidateStartMs = 0;
+}
+
+void forceRelayOpenAndReset() {
+	writeRelay(false);
+	resetAutoTimers();
+}
 
 void writeRelay(bool closed) {
 	relayClosed = closed;
@@ -173,9 +190,13 @@ void drawUi(ControlMode mode, float thresholdLux) {
 		display.setFont(u8g2_font_6x12_tf);
 		display.setCursor(0, 25);
 		display.print(F("Lux: "));
-		float displayLux = constrain(currentLux, 0.0f, 32767.0f);
-		display.print(static_cast<int>(displayLux + 0.5f));
-		display.print(F(" lx"));
+		if (sensorReady) {
+			float displayLux = constrain(currentLux, 0.0f, 32767.0f);
+			display.print(static_cast<int>(displayLux + 0.5f));
+			display.print(F(" lx"));
+		} else {
+			display.print(F("ERR"));
+		}
 
 		display.setCursor(0, 37);
 		display.print(F("Set: "));
@@ -206,15 +227,13 @@ void setup() {
 	pinMode(PIN_HANDBRAKE, INPUT_PULLUP);
 
 	// Fail-safe default: relay open at startup.
-	writeRelay(false);
+	forceRelayOpenAndReset();
 
 	Wire.begin();
-	// Prevent an I2C glitch (e.g. sensor saturating in bright light) from hanging the sketch forever.
+	// Prevent an I2C glitch from hanging the sketch forever.
 	Wire.setWireTimeout(25000, true);
 	sensorReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-	if (!sensorReady) {
-		writeRelay(false);
-	}
+	consecutiveSensorErrors = sensorReady ? 0 : MAX_SENSOR_ERRORS_BEFORE_FAULT;
 
 	// U8g2 does not provide a simple init-fail status; begin and continue.
 	display.begin();
@@ -233,6 +252,24 @@ void setup() {
 	} while (display.nextPage());
 }
 
+void recoverI2cDevices() {
+	// A short car supply glitch can leave I2C devices or the AVR bus in a bad state.
+	// Reinitialize both devices periodically so the controller can recover without a power cycle.
+	Wire.end();
+	pinMode(A4, INPUT_PULLUP);
+	pinMode(A5, INPUT_PULLUP);
+	delay(10);
+	Wire.begin();
+	Wire.setWireTimeout(25000, true);
+
+	sensorReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+	consecutiveSensorErrors = sensorReady ? 0 : MAX_SENSOR_ERRORS_BEFORE_FAULT;
+	hasLuxSample = false;
+
+	display.begin();
+	displayReady = true;
+}
+
 void loop() {
 	unsigned long now = millis();
 
@@ -240,24 +277,34 @@ void loop() {
 		lastSensorReadMs = now;
 
 		if (sensorReady) {
-			currentLux = lightMeter.readLightLevel();
-			// isnan() alone misses +Infinity, which a saturated/glitching sensor can return.
-			if (currentLux < 0.0f || isnan(currentLux) || isinf(currentLux) || currentLux > MAX_VALID_LUX) {
-				sensorReady = false;
-				writeRelay(false);
-				darkCandidateStartMs = 0;
-				brightCandidateStartMs = 0;
-				currentLux = 0.0f;
-				filteredLux = 0.0f;
+			float rawLux = lightMeter.readLightLevel();
+			if (rawLux < 0.0f || isnan(rawLux) || isinf(rawLux) || rawLux > MAX_VALID_LUX) {
+				if (consecutiveSensorErrors < 255) {
+					consecutiveSensorErrors++;
+				}
+				if (consecutiveSensorErrors >= MAX_SENSOR_ERRORS_BEFORE_FAULT) {
+					sensorReady = false;
+					hasLuxSample = false;
+					forceRelayOpenAndReset();
+				}
 			} else {
-				// Lightweight smoothing for stable display and control.
-				filteredLux = (filteredLux * 0.75f) + (currentLux * 0.25f);
+				consecutiveSensorErrors = 0;
+				if (!hasLuxSample) {
+					filteredLux = rawLux;
+					hasLuxSample = true;
+				} else {
+					// Lightweight smoothing for stable display and control.
+					filteredLux = (filteredLux * 0.75f) + (rawLux * 0.25f);
+				}
 				currentLux = filteredLux;
 			}
-		} else {
-			writeRelay(false);
-			darkCandidateStartMs = 0;
-			brightCandidateStartMs = 0;
+		} else if (now - lastSensorReinitAttemptMs >= SENSOR_REINIT_INTERVAL_MS) {
+			lastSensorReinitAttemptMs = now;
+			sensorReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+			if (sensorReady) {
+				consecutiveSensorErrors = 0;
+				hasLuxSample = false;
+			}
 		}
 	}
 
@@ -267,23 +314,21 @@ void loop() {
 
 	if (handbrakeOn) {
 		// Safety interlock: handbrake engaged keeps headlights relay open.
-		writeRelay(false);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		forceRelayOpenAndReset();
 	} else if (!sensorReady) {
-		writeRelay(false);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		forceRelayOpenAndReset();
 	} else if (mode == MODE_FORCE_ON) {
 		writeRelay(true);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		resetAutoTimers();
 	} else if (mode == MODE_FORCE_OFF) {
-		writeRelay(false);
-		darkCandidateStartMs = 0;
-		brightCandidateStartMs = 0;
+		forceRelayOpenAndReset();
 	} else {
 		updateAutoRelayWithDelay(now, thresholdLux);
+	}
+
+	if (!sensorReady && (now - lastI2cRecoveryMs >= I2C_RECOVERY_INTERVAL_MS)) {
+		lastI2cRecoveryMs = now;
+		recoverI2cDevices();
 	}
 
 	if (displayReady && (now - lastDisplayRefreshMs >= DISPLAY_INTERVAL_MS)) {
